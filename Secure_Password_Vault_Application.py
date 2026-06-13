@@ -1,346 +1,353 @@
 import os
 import hashlib
 import json
-import struct
+import base64
 
-# =====================================================================
-# PART 1: Key Derivation Function (scrypt)
-# According to the instructions, using external libraries for
-# Key Generation and Hash Functions is explicitly allowed.
-# =====================================================================
+# ==============================================================================
+# PART 1: CRYPTOGRAPHIC FUNCTIONS (According to project guidelines)
+# ==============================================================================
 
-def derive_key(master_password: str, salt: bytes) -> bytes:
+def derive_key_scrypt(password: str, salt: bytes) -> bytes:
     """
-    Step 1: Convert the user's master password into a strong cryptographic key.
-    We use the 'scrypt' algorithm because it is designed to be slow and
-    memory-intensive, making brute-force attacks very difficult.
+    REPORT: "scrypt (Key Derivation)"
+    According to the instructions, using built-in libraries for key generation is allowed.
+    This function takes the user's password and salt, and generates a strong SECRET SYMMETRIC KEY.
+    dklen=32 ensures the output is exactly 32 bytes (256 bits).
     """
-    key = hashlib.scrypt(
-        master_password.encode('utf-8'),
-        salt=salt,
-        n=16384, # CPU/Memory cost factor
-        r=8,     # Block size
-        p=1,     # Parallelization factor
-        dklen=64 # Desired Key Length (64 bytes = 512 bits)
+    return hashlib.scrypt(password.encode('utf-8'), salt=salt, n=16384, r=8, p=1, dklen=32)
+
+def pure_threefish_ctr_process(data: bytes, key: bytes, nonce: bytes) -> bytes:
+    """
+    REPORT: "Threefish in CTR Mode (Symmetric Encryption)"
+    REPORT: "transforms the block cipher into a fast stream cipher"
+    """
+
+    C240 = 0x1BD11BDAA9FC1A22
+
+    def ROTL64(x, y):
+        return ((x << y) & 0xFFFFFFFFFFFFFFFF) | (x >> (64 - y))
+
+    def bytes_to_words(b):
+        return [int.from_bytes(b[i*8:(i+1)*8], 'little') for i in range(len(b)//8)]
+
+    def words_to_bytes(w):
+        return b''.join(x.to_bytes(8, 'little') for x in w)
+
+    ROT = (
+        (14, 16),
+        (52, 57),
+        (23, 40),
+        (5, 37),
+        (25, 33),
+        (46, 12),
+        (58, 22),
+        (32, 32)
     )
-    return key
 
-# =====================================================================
-# PART 2: Symmetric Encryption - Pure Python Threefish-512 & CTR Mode
-# No external cryptographic libraries are used here.
-# =====================================================================
+    key_words = bytes_to_words(key)
+    k_0, k_1, k_2, k_3 = key_words
+    k_4 = k_0 ^ k_1 ^ k_2 ^ k_3 ^ C240
+    K_ext = (k_0, k_1, k_2, k_3, k_4)
 
-def threefish_mix(x, y, rotation):
-    """
-    The MIX function is the core of the Threefish algorithm.
-    It uses an ARX structure: Addition, Rotation, and XOR.
-    """
-    mask = 0xFFFFFFFFFFFFFFFF # Ensure 64-bit bounds
+    t_0 = 0
+    t_1 = 0
+    t_2 = t_0 ^ t_1
+    T_ext = (t_0, t_1, t_2)
 
-    # Step 1: Addition (x + y)
-    x = (x + y) & mask
+    result = bytearray()
+    counter = 0
 
-    # Step 2: Rotation (bitwise circular shift of y)
-    y = ((y << rotation) | (y >> (64 - rotation))) & mask
+    for i in range(0, len(data), 32):
+        counter_bytes = counter.to_bytes(16, 'little')
+        block_bytes = nonce + counter_bytes
+        v_words = bytes_to_words(block_bytes)
+        v_0, v_1, v_2, v_3 = v_words
 
-    # Step 3: XOR (x XOR y)
-    y = x ^ y
+        for d in range(72):
+            if d % 4 == 0:
+                s = d // 4
+                sk_0 = K_ext.__getitem__(s % 5)
+                sk_1 = (K_ext.__getitem__((s + 1) % 5) + T_ext.__getitem__(s % 3)) & 0xFFFFFFFFFFFFFFFF
+                sk_2 = (K_ext.__getitem__((s + 2) % 5) + T_ext.__getitem__((s + 1) % 3)) & 0xFFFFFFFFFFFFFFFF
+                sk_3 = (K_ext.__getitem__((s + 3) % 5) + s) & 0xFFFFFFFFFFFFFFFF
 
-    return x, y
+                v_0 = (v_0 + sk_0) & 0xFFFFFFFFFFFFFFFF
+                v_1 = (v_1 + sk_1) & 0xFFFFFFFFFFFFFFFF
+                v_2 = (v_2 + sk_2) & 0xFFFFFFFFFFFFFFFF
+                v_3 = (v_3 + sk_3) & 0xFFFFFFFFFFFFFFFF
 
-def threefish_encrypt_block(key: bytes, tweak: bytes, plaintext_block: bytes) -> bytes:
-    """
-    Encrypts a single 64-byte (512-bit) block using the Threefish algorithm.
-    This is a pure-Python implementation of the ARX structure.
-    """
-    # Convert the 64-byte blocks into 8 separate 64-bit integers
-    v = list(struct.unpack('<8Q', plaintext_block))
-    k = list(struct.unpack('<8Q', key))
-    t = list(struct.unpack('<2Q', tweak))
+            rot_d = ROT.__getitem__(d % 8)
+            r_0 = rot_d.__getitem__(0)
+            r_1 = rot_d.__getitem__(1)
 
-    # Generate extra key and tweak words (required by the algorithm structure)
-    k_parity = 0x1BD11BDAA9FC1A22
-    for i in range(8):
-        k_parity ^= k[ i ]
-    k.append(k_parity)
-    t.append(t[ 0 ] ^ t[ 1 ])
+            y_0 = (v_0 + v_1) & 0xFFFFFFFFFFFFFFFF
+            y_1 = ROTL64(v_1, r_0) ^ y_0
 
-    # Proper rotation constants for Threefish-512 (with spaces to prevent deletion)
-    rotations = [
-        [ 46, 36, 19, 37 ],
-        [ 33, 27, 14, 42 ],
-        [ 17, 49, 36, 39 ],
-        [ 44,  9, 54, 56 ],
-        [ 39, 30, 34, 24 ],
-        [ 13, 50, 10, 17 ],
-        [ 25, 29, 39, 43 ],
-        [  8, 35, 56, 22 ]
-    ]
+            y_2 = (v_2 + v_3) & 0xFFFFFFFFFFFFFFFF
+            y_3 = ROTL64(v_3, r_1) ^ y_2
 
-    # Perform 72 rounds of mixing and permuting
-    for d in range(72):
-        # Inject subkeys every 4 rounds to add complexity
-        if d % 4 == 0:
-            s = d // 4
-            for i in range(8):
-                subkey = k[ (s + i) % 9 ]
-                if i == 5:
-                    subkey += t[ s % 3 ]
-                elif i == 6:
-                    subkey += t[ (s + 1) % 3 ]
-                elif i == 7:
-                    subkey += s # Add the round counter
-                v[ i ] = (v[ i ] + subkey) & 0xFFFFFFFFFFFFFFFF
+            v_0, v_1, v_2, v_3 = y_0, y_3, y_2, y_1
 
-        # Get rotation values for the current round
-        r = rotations[ d % 8 ]
+        s = 72 // 4
+        sk_0 = K_ext.__getitem__(s % 5)
+        sk_1 = (K_ext.__getitem__((s + 1) % 5) + T_ext.__getitem__(s % 3)) & 0xFFFFFFFFFFFFFFFF
+        sk_2 = (K_ext.__getitem__((s + 2) % 5) + T_ext.__getitem__((s + 1) % 3)) & 0xFFFFFFFFFFFFFFFF
+        sk_3 = (K_ext.__getitem__((s + 3) % 5) + s) & 0xFFFFFFFFFFFFFFFF
 
-        # Apply the MIX function to pairs of integers
-        v[ 0 ], v[ 1 ] = threefish_mix(v[ 0 ], v[ 1 ], r[ 0 ])
-        v[ 2 ], v[ 3 ] = threefish_mix(v[ 2 ], v[ 3 ], r[ 1 ])
-        v[ 4 ], v[ 5 ] = threefish_mix(v[ 4 ], v[ 5 ], r[ 2 ])
-        v[ 6 ], v[ 7 ] = threefish_mix(v[ 6 ], v[ 7 ], r[ 3 ])
+        v_0 = (v_0 + sk_0) & 0xFFFFFFFFFFFFFFFF
+        v_1 = (v_1 + sk_1) & 0xFFFFFFFFFFFFFFFF
+        v_2 = (v_2 + sk_2) & 0xFFFFFFFFFFFFFFFF
+        v_3 = (v_3 + sk_3) & 0xFFFFFFFFFFFFFFFF
 
-        # Simple Permutation (shuffle the order for the next round)
-        v = [ v[ 2 ], v[ 1 ], v[ 4 ], v[ 7 ], v[ 6 ], v[ 5 ], v[ 0 ], v[ 3 ] ]
+        keystream = words_to_bytes((v_0, v_1, v_2, v_3))
+        chunk = data[i:i+32]
 
-    # Final subkey addition after all 72 rounds
-    s = 18 # 72 // 4
-    for i in range(8):
-        subkey = k[ (s + i) % 9 ]
-        if i == 5:
-            subkey += t[ s % 3 ]
-        elif i == 6:
-            subkey += t[ (s + 1) % 3 ]
-        elif i == 7:
-            subkey += s
-        v[ i ] = (v[ i ] + subkey) & 0xFFFFFFFFFFFFFFFF
+        for b_data, b_key in zip(chunk, keystream):
+            result.append(b_data ^ b_key)
 
-    # Pack the 8 integers back into a single 64-byte ciphertext block
-    return struct.pack('<8Q', *v)
+        counter += 1
 
-def encrypt_ctr(key: bytes, plaintext: bytes) -> bytes:
-    """
-    Encrypts variable-length data using Threefish in Counter (CTR) mode.
-    Why CTR? It turns a block cipher into a stream cipher.
-    """
-    nonce = os.urandom(16)
-    tweak = b'\x00' * 16
-    ciphertext = bytearray()
-    block_size = 64
+    return bytes(result)
 
-    for i in range(0, len(plaintext), block_size):
-        counter_bytes = struct.pack('<Q', i // block_size)
-        counter_block = nonce + counter_bytes + (b'\x00' * (block_size - len(nonce) - len(counter_bytes)))
+# ==============================================================================
+# PURE PYTHON ED25519 MATH (From RFC 8032)
+# ==============================================================================
+_b = 256
+_q = 2**255 - 19
+_l = 2**252 + 27742317777372353535851937790883648493
 
-        keystream = threefish_encrypt_block(key, tweak, counter_block)
+def _inv(x): return pow(x, _q-2, _q)
+_d = -121665 * _inv(121666) % _q
+_I = pow(2, (_q-1)//4, _q)
 
-        chunk = plaintext[i:i+block_size]
-        encrypted_chunk = bytes(a ^ b for a, b in zip(chunk, keystream[:len(chunk)]))
-        ciphertext.extend(encrypted_chunk)
-
-    return nonce + ciphertext
-
-def decrypt_ctr(key: bytes, ciphertext: bytes) -> bytes:
-    """
-    Decrypts data using Threefish in Counter (CTR) mode.
-    In CTR mode, decryption is mathematically identical to encryption.
-    """
-    nonce = ciphertext[:16]
-    actual_ciphertext = ciphertext[16:]
-    plaintext = bytearray()
-    tweak = b'\x00' * 16
-    block_size = 64
-
-    for i in range(0, len(actual_ciphertext), block_size):
-        counter_bytes = struct.pack('<Q', i // block_size)
-        counter_block = nonce + counter_bytes + (b'\x00' * (block_size - len(nonce) - len(counter_bytes)))
-
-        keystream = threefish_encrypt_block(key, tweak, counter_block)
-
-        chunk = actual_ciphertext[i:i+block_size]
-        decrypted_chunk = bytes(a ^ b for a, b in zip(chunk, keystream[:len(chunk)]))
-        plaintext.extend(decrypted_chunk)
-
-    return bytes(plaintext)
-
-# =====================================================================
-# PART 3: Pure Python Ed25519 (Digital Signature)
-# No external cryptographic libraries used. Math is based on Edwards curve.
-# =====================================================================
-
-# Constant curve parameters for Ed25519
-Q = 2**255 - 19
-L = 2**252 + 27742317777372353535851937790883648493
-
-def inv(x):
-    """Calculates the modular inverse."""
-    return pow(x, Q - 2, Q)
-
-d = -121665 * inv(121666) % Q
-I = pow(2, (Q - 1) // 4, Q)
-
-def xrecover(y):
-    """Recovers the X coordinate given the Y coordinate on the curve."""
-    xx = (y*y - 1) * inv(d*y*y + 1)
-    x = pow(xx, (Q + 3) // 8, Q)
-    if (x*x - xx) % Q != 0: x = (x * I) % Q
-    if x % 2 != 0: x = Q - x
+def _xrecover(y):
+    xx = (y*y-1) * _inv(_d*y*y+1)
+    x = pow(xx, (_q+3)//8, _q)
+    if (x*x - xx) % _q != 0: x = (x*_I) % _q
+    if x % 2 != 0: x = _q-x
     return x
 
-# Base point (Generator) of the Ed25519 curve
-By = 4 * inv(5)
-Bx = xrecover(By)
-B = (Bx % Q, By % Q)
+_By = 4 * _inv(5) % _q
+_Bx = _xrecover(_By)
+_B = [_Bx % _q, _By % _q]
 
-def edwards_add(P, Q_point):
-    """Adds two points on the Edwards curve."""
+def _edwards_add(P, Q):
     x1, y1 = P
-    x2, y2 = Q_point
-    x3 = (x1*y2 + x2*y1) * inv(1 + d*x1*x2*y1*y2)
-    y3 = (y1*y2 + x1*x2) * inv(1 - d*x1*x2*y1*y2)
-    return (x3 % Q, y3 % Q)
+    x2, y2 = Q
+    x3 = (x1*y2 + x2*y1) * _inv(1 + _d*x1*x2*y1*y2) % _q
+    y3 = (y1*y2 + x1*x2) * _inv(1 - _d*x1*x2*y1*y2) % _q
+    return [x3, y3]
 
-def edwards_scalarmult(P, e):
-    """Multiplies a point P by a scalar e on the curve."""
+def _scalarmult(P, e):
     if e == 0: return (0, 1)
-    Q_point = edwards_scalarmult(P, e // 2)
-    Q_point = edwards_add(Q_point, Q_point)
-    if e & 1: Q_point = edwards_add(Q_point, P)
-    return Q_point
+    Q = _scalarmult(P, e // 2)
+    Q = _edwards_add(Q, Q)
+    if e & 1: Q = _edwards_add(Q, P)
+    return Q
 
-def encodeint(y):
-    bits = [(y >> i) & 1 for i in range(256)]
-    return bytes(sum([bits[i * 8 + j] << j for j in range(8)]) for i in range(32))
+def _encodeint(y):
+    bits = [(y >> i) & 1 for i in range(_b)]
+    return bytes([sum([bits[i * 8 + j] << j for j in range(8)]) for i in range(_b // 8)])
 
-def encodepoint(P):
+def _encodepoint(P):
     x, y = P
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum([bits[i * 8 + j] << j for j in range(8)]) for i in range(32))
+    bits = [(y >> i) & 1 for i in range(_b - 1)] + [x & 1]
+    return bytes([sum([bits[i * 8 + j] << j for j in range(8)]) for i in range(_b // 8)])
 
-def decodeint(s):
-    return sum(s[i] << (8 * i) for i in range(32))
+def _bit(h, i): return (h[i//8] >> (i%8)) & 1
 
-def decodepoint(s):
-    y = sum((s[i] & 0xFF) << (8 * i) for i in range(32))
-    x_is_odd = (y >> 255) & 1
-    y &= (1 << 255) - 1
-    x = xrecover(y)
-    if x & 1 != x_is_odd: x = Q - x
-    return (x, y)
+def _publickey(sk):
+    h = hashlib.sha512(sk).digest()
+    a = 2**(_b-2) + sum(2**i * _bit(h,i) for i in range(3, _b-2))
+    A = _scalarmult(_B, a)
+    return _encodepoint(A)
 
-def Hint(m):
-    """Generates a SHA512 hash and converts it to an integer."""
+def _Hint(m):
     h = hashlib.sha512(m).digest()
-    return sum(h[i] << (8 * i) for i in range(64))
+    return sum(2**i * _bit(h,i) for i in range(2*_b))
 
-def ed25519_generate_keys():
-    """Generates a private and public key pair for digital signatures."""
-    secret = os.urandom(32)
-    h = hashlib.sha512(secret).digest()
-    a = 2**(254) + sum(h[i] << (8 * i) for i in range(3, 32))
-    A = edwards_scalarmult(B, a)
-    public_key = encodepoint(A)
-    return secret, public_key
+def _signature(m, sk, pk):
+    h = hashlib.sha512(sk).digest()
+    a = 2**(_b-2) + sum(2**i * _bit(h,i) for i in range(3, _b-2))
+    r = _Hint(bytes([h[i] for i in range(_b//8, _b//4)]) + m)
+    R = _scalarmult(_B, r)
+    S = (r + _Hint(_encodepoint(R) + pk + m) * a) % _l
+    return _encodepoint(R) + _encodeint(S)
 
-def ed25519_sign(private_key: bytes, message: bytes) -> bytes:
-    """Signs a message to prove authenticity and integrity."""
-    h = hashlib.sha512(private_key).digest()
-    a = 2**(254) + sum(h[i] << (8 * i) for i in range(3, 32))
-    r = Hint(h[32:] + message)
-    R = edwards_scalarmult(B, r)
-    A = edwards_scalarmult(B, a)
-    S = (r + Hint(encodepoint(R) + encodepoint(A) + message) * a) % L
-    return encodepoint(R) + encodeint(S)
+def _isoncurve(P):
+    x, y = P
+    return (-x*x + y*y - 1 - _d*x*x*y*y) % _q == 0
 
-def ed25519_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
-    """Verifies the signature of a message."""
-    if len(signature) != 64:
+def _decodeint(s): return sum(2**i * _bit(s,i) for i in range(0, _b))
+
+def _decodepoint(s):
+    y = sum(2**i * _bit(s,i) for i in range(0, _b-1))
+    x = _xrecover(y)
+    if x & 1 != _bit(s, _b-1): x = _q-x
+    P = [x, y]
+    if not _isoncurve(P): raise Exception("Not on curve")
+    return P
+
+def _checkvalid(s, m, pk):
+    if len(s) != _b//4: return False
+    if len(pk) != _b//8: return False
+    try:
+        R = _decodepoint(s[:_b//8])
+        A = _decodepoint(pk)
+        S = _decodeint(s[_b//8:_b//4])
+        h = _Hint(_encodepoint(R) + pk + m)
+        return _encodepoint(_scalarmult(_B, S)) == _encodepoint(_edwards_add(R, _scalarmult(A, h)))
+    except:
         return False
-    R = decodepoint(signature[:32])
-    A = decodepoint(public_key)
-    S = decodeint(signature[32:])
-    h = Hint(signature[:32] + public_key + message)
 
-    SB = edwards_scalarmult(B, S)
-    hA = edwards_scalarmult(A, h)
-    RhA = edwards_add(R, hA)
+# ==============================================================================
+# ed25519   Usage:
+# ==============================================================================
 
-    return SB == RhA
+def pure_ed25519_generate_keys():
+    """
+    REPORT: "generates an Ed25519 PRIVATE KEY (kept secret) and a PUBLIC KEY"
+    """
+    private_key = os.urandom(32)
+    public_key = _publickey(private_key)
+    return private_key, public_key
 
-# =====================================================================
-# PART 4: Secure Password Vault Application (Main Local Flow)
-# =====================================================================
+def pure_ed25519_sign(private_key: bytes, message: bytes) -> bytes:
+    """
+    REPORT: "Device A signs the encrypted vault using its PRIVATE KEY"
+    """
+    public_key = _publickey(private_key)
+    return _signature(message, private_key, public_key)
+
+def pure_ed25519_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    """
+    REPORT: "uses it to verify the digital signature"
+    """
+    return _checkvalid(signature, message, public_key)
+
+
+# ==============================================================================
+# PART 2: SYSTEM FLOW (Exactly matching the Report steps)
+# ==============================================================================
 
 def main():
-    print("===================================================")
-    print("       SECURE PASSWORD VAULT APPLICATION")
-    print("===================================================\n")
+    print("=====================================================")
+    print("   Secure Password Vault Application (Topic 13)      ")
+    print("=====================================================")
 
-    # ---------------------------------------------------------
-    # Step 1: Alice sets up the vault locally
-    # ---------------------------------------------------------
-    print(" ALICE'S ENVIRONMENT:")
-    alice_master_password = "MyStrongPassword123!"
+    # Original data and user password
+    original_vault_data = b"Bank: 123456, Email: Pass!@#, Facebook: Sec99"
+    user_master_password = "masterPassword123!"
+
+    print(f"\n[INFO] Original Plaintext Vault: '{original_vault_data.decode('utf-8')}'")
+    print(f"[INFO] User Master Password: '{user_master_password}'")
+
+    # --------------------------------------------------------------------------
+    # REPORT: Step 1 (Setup)
+    # --------------------------------------------------------------------------
+    print("\n--- Step 1: Setup (Device A) ---")
+
+    # REPORT: "The system generates a random salt"
     salt = os.urandom(16)
+    print(f"[*] Generated Salt (16 bytes / 128 bits) [Hex]:\n    {salt.hex()}")
 
-    print("    -> Deriving 512-bit symmetric key using scrypt...")
-    alice_symmetric_key = derive_key(alice_master_password, salt)
+    # REPORT: "derives a SECRET SYMMETRIC KEY using scrypt"
+    secret_symmetric_key_A = derive_key_scrypt(user_master_password, salt)
+    print(f"[*] Derived SECRET SYMMETRIC KEY (32 bytes / 256 bits) [Hex]:\n    {secret_symmetric_key_A.hex()}")
 
-    print("    -> Generating Ed25519 Public/Private key pair for signatures...")
-    alice_priv_key, alice_pub_key = ed25519_generate_keys()
+    # REPORT: "generates an Ed25519 PRIVATE KEY (kept secret) and a PUBLIC KEY"
+    private_key_A, public_key_A = pure_ed25519_generate_keys()
+    print(f"[*] Generated Ed25519 PRIVATE KEY (32 bytes / 256 bits) [Hex]:\n    {private_key_A.hex()}")
+    print(f"[*] Generated Ed25519 PUBLIC KEY (32 bytes / 256 bits) [Hex]:\n    {public_key_A.hex()}")
 
-    vault_data = {
-        "email": "alice_mail_pass_88",
-        "facebook": "alice_fb_pass_99",
-        "bank_account": "alice_bank_secret_$$$"
+    # --------------------------------------------------------------------------
+    # REPORT: Step 2 (Encryption)
+    # --------------------------------------------------------------------------
+    print("\n--- Step 2: Encryption (Device A) ---")
+    nonce = os.urandom(16) # Required for CTR mode
+    print(f"[*] Generated Nonce for CTR Mode (16 bytes / 128 bits) [Hex]:\n    {nonce.hex()}")
+
+    # REPORT: "The local password vault on Device A is encrypted using Threefish in CTR mode"
+    encrypted_vault = pure_threefish_ctr_process(original_vault_data, secret_symmetric_key_A, nonce)
+    print(f"[*] Encrypted Vault Ciphertext [Hex]:\n    {encrypted_vault.hex()}")
+
+    # --------------------------------------------------------------------------
+    # REPORT: Step 3 (Signing)
+    # --------------------------------------------------------------------------
+    print("\n--- Step 3: Signing (Device A) ---")
+
+    # REPORT: "Device A signs the encrypted vault using its PRIVATE KEY, generating a digital signature"
+    data_to_sign = nonce + encrypted_vault
+    digital_signature = pure_ed25519_sign(private_key_A, data_to_sign)
+    print(f"[*] Digital Signature (64 bytes / 512 bits) [Hex]:\n    {digital_signature.hex()}")
+
+    # --------------------------------------------------------------------------
+    # REPORT: Step 4 (Export)
+    # --------------------------------------------------------------------------
+    print("\n--- Step 4: Export (Device A -> Device B) ---")
+
+    # REPORT: "explicitly contains four elements: 1) encrypted vault, 2) digital signature, 3) PUBLIC KEY, and 4) random salt"
+    export_package = {
+        "encrypted_vault": base64.b64encode(encrypted_vault).decode('utf-8'),
+        "signature": base64.b64encode(digital_signature).decode('utf-8'),
+        "public_key": base64.b64encode(public_key_A).decode('utf-8'),
+        "salt": base64.b64encode(salt).decode('utf-8'),
+        "nonce": base64.b64encode(nonce).decode('utf-8')
     }
-    vault_bytes = json.dumps(vault_data).encode('utf-8')
-    print("    -> Vault populated with 3 credentials.")
 
-    # ---------------------------------------------------------
-    # Step 2: Alice encrypts and signs the vault for export
-    # ---------------------------------------------------------
-    print("\n EXPORTING THE VAULT (ENCRYPTION & SIGNING):")
+    print("[*] Exporting the following JSON package to Device B:")
+    print(json.dumps(export_package, indent=4))
 
-    print("    -> Encrypting vault data using Threefish in CTR Mode...")
-    encrypted_vault = encrypt_ctr(alice_symmetric_key, vault_bytes)
+    # ==========================================================================
+    # --- TRANSITION TO DEVICE B ---
+    # ==========================================================================
 
-    print("    -> Signing the encrypted file using Ed25519 Private Key...")
-    signature = ed25519_sign(alice_priv_key, encrypted_vault)
+    # Receiving the package and unpacking the data
+    package_json = json.dumps(export_package)
+    received_pkg = json.loads(package_json)
 
-    # ---------------------------------------------------------
-    # Step 3: Bob receives and verifies the vault
-    # ---------------------------------------------------------
-    print("\n BOB'S ENVIRONMENT (RECEIVING DATA):")
-    print("    -> Bob received the encrypted vault, the salt, and the signature.")
+    recv_enc_vault = base64.b64decode(received_pkg["encrypted_vault"])
+    recv_signature = base64.b64decode(received_pkg["signature"])
+    recv_pub_key   = base64.b64decode(received_pkg["public_key"])
+    recv_salt      = base64.b64decode(received_pkg["salt"])
+    recv_nonce     = base64.b64decode(received_pkg["nonce"])
 
-    print("    -> Verifying Alice's signature using her Public Key...")
-    is_authentic = ed25519_verify(alice_pub_key, encrypted_vault, signature)
+    # --------------------------------------------------------------------------
+    # REPORT: Step 5 (Verification)
+    # --------------------------------------------------------------------------
+    print("\n--- Step 5: Verification (Device B) ---")
 
-    if not is_authentic:
-        print("    [!] ALERT: Signature verification failed. Data might be corrupted or forged!")
+    # REPORT: "extracts Device A's PUBLIC KEY from the package and uses it to verify the digital signature"
+    recv_data_to_verify = recv_nonce + recv_enc_vault
+    is_valid = pure_ed25519_verify(recv_pub_key, recv_data_to_verify, recv_signature)
+
+    # REPORT: "If the signature is invalid, the system halts immediately to prevent attacks"
+    if not is_valid:
+        print("[!] CRITICAL ERROR: Digital signature is invalid! Halting system.")
         return
 
-    print("    [+] Signature Verified! Data is authentic and intact.")
+    print("[+] Signature verified successfully! File is authentic and unaltered.")
 
-    # ---------------------------------------------------------
-    # Step 4: Bob decrypts the vault
-    # ---------------------------------------------------------
-    print("\n DECRYPTING THE VAULT:")
-    print("    -> Bob derives the symmetric key using the shared Master Password...")
-    bob_symmetric_key = derive_key("MyStrongPassword123!", salt)
+    # --------------------------------------------------------------------------
+    # REPORT: Step 6 (Decryption)
+    # --------------------------------------------------------------------------
+    print("\n--- Step 6: Decryption (Device B) ---")
 
-    print("    -> Decrypting vault data using Threefish in CTR Mode...")
-    decrypted_vault_bytes = decrypt_ctr(bob_symmetric_key, encrypted_vault)
+    # REPORT: "If the signature is valid, the user inputs their master password on Device B"
+    print(f"[*] User inputs master password on Device B: '{user_master_password}'")
 
-    decrypted_vault_data = json.loads(decrypted_vault_bytes.decode('utf-8'))
+    # REPORT: "system uses the received salt and scrypt to reconstruct the exact same SECRET SYMMETRIC KEY"
+    secret_symmetric_key_B = derive_key_scrypt(user_master_password, recv_salt)
+    print(f"[*] Reconstructed SECRET SYMMETRIC KEY on Device B (32 bytes / 256 bits) [Hex]:\n    {secret_symmetric_key_B.hex()}")
 
-    print("\n===================================================")
-    print("[+] SUCCESS! RECOVERED PASSWORDS:")
-    for service, pwd in decrypted_vault_data.items():
-        print(f"    - {service.capitalize()}: {pwd}")
-    print("===================================================")
+    if secret_symmetric_key_A == secret_symmetric_key_B:
+        print("[+] SUCCESS: The reconstructed key matches the original key perfectly!")
+
+    # REPORT: "Finally, Device B decrypts the vault using Threefish in CTR mode"
+    decrypted_vault = pure_threefish_ctr_process(recv_enc_vault, secret_symmetric_key_B, recv_nonce)
+
+    print(f"\n[+] Vault decrypted successfully! \n[+] Original contents revealed: '{decrypted_vault.decode('utf-8')}'")
+
 
 if __name__ == "__main__":
     main()
